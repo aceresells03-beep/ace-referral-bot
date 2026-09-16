@@ -3,6 +3,7 @@ import random
 import string
 import discord
 import asyncpg
+import aiohttp
 from discord.ext import commands
 
 TOKEN = os.getenv("DISCORD_TOKEN")
