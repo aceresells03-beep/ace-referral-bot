@@ -1,1 +1,2 @@
 discord.py==2.6.4
+asyncpg==0.30.0
