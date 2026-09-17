@@ -34,6 +34,7 @@ PORT = int(os.getenv("PORT", "8080"))
 intents = discord.Intents.default()
 intents.guilds = True
 intents.message_content = True
+intents.members = True
 
 bot = commands.Bot(
     command_prefix="!",
@@ -49,6 +50,7 @@ db_pool = None
 
 def generate_code():
     characters = string.ascii_uppercase + string.digits
+
     random_part = "".join(
         random.choices(characters, k=5)
     )
@@ -89,6 +91,7 @@ async def create_sellauth_coupon(code):
     }
 
     async with aiohttp.ClientSession() as session:
+
         async with session.post(
             url,
             json=payload,
@@ -101,7 +104,8 @@ async def create_sellauth_coupon(code):
 
                 print(
                     "SellAuth coupon creation failed "
-                    f"({response.status}): {response_text}"
+                    f"({response.status}): "
+                    f"{response_text}"
                 )
 
                 return False
@@ -127,6 +131,7 @@ async def get_sellauth_invoice(invoice_id):
     }
 
     async with aiohttp.ClientSession() as session:
+
         async with session.get(
             url,
             headers=headers
@@ -278,7 +283,6 @@ def extract_coupon_code(invoice):
     if not coupon:
         return None
 
-    # SellAuth may return the coupon as an object.
     if isinstance(coupon, dict):
 
         code = coupon.get("code")
@@ -286,8 +290,6 @@ def extract_coupon_code(invoice):
         if code:
             return str(code).upper()
 
-    # Defensive support in case the API
-    # returns the code directly.
     if isinstance(coupon, str):
         return coupon.upper()
 
@@ -307,7 +309,6 @@ async def process_referral_invoice(invoice_id):
     if not invoice:
         return
 
-    # Verify invoice belongs to our SellAuth shop.
     if str(invoice.get("shop_id")) != str(
         SELLAUTH_SHOP_ID
     ):
@@ -319,7 +320,6 @@ async def process_referral_invoice(invoice_id):
 
         return
 
-    # Only completed invoices count.
     if invoice.get("status") != "completed":
 
         print(
@@ -334,20 +334,24 @@ async def process_referral_invoice(invoice_id):
     )
 
     if not coupon_code:
+
         print(
             f"Invoice {invoice_id} has no coupon."
         )
+
         return
 
-    # Only our generated referral codes matter.
     if not coupon_code.startswith("ACE-"):
+
         print(
             f"Invoice {invoice_id} used "
             f"non-referral coupon {coupon_code}."
         )
+
         return
 
     try:
+
         sale_amount = float(
             invoice.get("paid_usd")
             or invoice.get("price_usd")
@@ -355,6 +359,7 @@ async def process_referral_invoice(invoice_id):
         )
 
     except (TypeError, ValueError):
+
         sale_amount = 0.0
 
     async with db_pool.acquire() as conn:
@@ -380,8 +385,6 @@ async def process_referral_invoice(invoice_id):
 
                 return
 
-            # Insert invoice first.
-            # If it already exists, it was already credited.
             inserted = await conn.fetchval(
                 """
                 INSERT INTO processed_referral_invoices (
@@ -428,7 +431,6 @@ async def process_referral_invoice(invoice_id):
         f"Invoice {invoice_id}"
     )
 
-    # DM referral owner.
     try:
 
         user = bot.get_user(
@@ -474,8 +476,6 @@ async def process_referral_invoice(invoice_id):
 
     except Exception as error:
 
-        # Referral is still credited even if
-        # Discord DMs are disabled.
         print(
             "Could not DM referral owner: "
             f"{error}"
@@ -546,6 +546,7 @@ async def sellauth_webhook(request):
             )
 
         try:
+
             payload = json.loads(
                 raw_body.decode("utf-8")
             )
@@ -565,7 +566,6 @@ async def sellauth_webhook(request):
             f"SellAuth webhook received: {event}"
         )
 
-        # Extra shop verification.
         if str(shop_id) != str(
             SELLAUTH_SHOP_ID
         ):
@@ -586,8 +586,6 @@ async def sellauth_webhook(request):
 
             if invoice_id:
 
-                # Process after acknowledging
-                # the webhook.
                 asyncio.create_task(
                     process_referral_invoice(
                         invoice_id
@@ -625,7 +623,9 @@ async def start_web_server():
         sellauth_webhook
     )
 
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(
+        app
+    )
 
     await runner.setup()
 
@@ -652,6 +652,7 @@ async def start_web_server():
 class ReferralView(discord.ui.View):
 
     def __init__(self):
+
         super().__init__(
             timeout=None
         )
@@ -724,7 +725,7 @@ class ReferralView(discord.ui.View):
 
 
 # =========================================================
-# REFERRAL STATS
+# MEMBER REFERRAL STATS
 # =========================================================
 
 @bot.command()
@@ -777,6 +778,126 @@ async def referrals(ctx):
             f"${float(referral['reward_balance']):.2f}"
         ),
         inline=True
+    )
+
+    await ctx.reply(
+        embed=embed
+    )
+
+
+# =========================================================
+# OWNER REFERRAL STATS
+# =========================================================
+
+@bot.command()
+@commands.is_owner()
+async def referralstats(
+    ctx,
+    member: discord.Member = None
+):
+
+    if member is None:
+
+        await ctx.reply(
+            "❌ Mention a member.\n\n"
+            "Example: `!referralstats @user`"
+        )
+
+        return
+
+    referral = await get_referral(
+        member.id
+    )
+
+    if not referral:
+
+        embed = discord.Embed(
+            title="❌ No Referral Account",
+            description=(
+                f"{member.mention} has not "
+                "generated a referral code yet."
+            )
+        )
+
+        await ctx.reply(
+            embed=embed
+        )
+
+        return
+
+    created_at = referral[
+        "created_at"
+    ]
+
+    if created_at:
+
+        created_text = (
+            created_at.strftime(
+                "%B %d, %Y"
+            )
+        )
+
+    else:
+
+        created_text = "Unknown"
+
+    embed = discord.Embed(
+        title="👑 Ace Referral Monitor",
+        description=(
+            f"Referral statistics for "
+            f"{member.mention}"
+        )
+    )
+
+    embed.set_thumbnail(
+        url=member.display_avatar.url
+    )
+
+    embed.add_field(
+        name="👤 Member",
+        value=(
+            f"{member}\n"
+            f"`{member.id}`"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🎟️ Referral Code",
+        value=(
+            f"`{referral['referral_code']}`"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="👥 Successful Referrals",
+        value=str(
+            referral["referral_count"]
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="💰 Sales Generated",
+        value=(
+            f"${float(referral['sales_generated']):.2f}"
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="🎁 Reward Balance",
+        value=(
+            f"${float(referral['reward_balance']):.2f}"
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="📅 Referral Member Since",
+        value=created_text,
+        inline=False
     )
 
     await ctx.reply(
@@ -878,6 +999,7 @@ async def main():
 
 
 if __name__ == "__main__":
+
     asyncio.run(
         main()
     )
