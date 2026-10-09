@@ -906,6 +906,57 @@ async def referralstats(
 
 
 # =========================================================
+# OWNER REFERRAL CODE LOOKUP
+# =========================================================
+
+@bot.command()
+@commands.is_owner()
+async def lookup(ctx, code: str = None):
+    if not code:
+        await ctx.reply("❌ Usage: `!lookup ACE-XXXXX`")
+        return
+
+    code = code.strip().upper()
+
+    async with db_pool.acquire() as conn:
+        referral = await conn.fetchrow(
+            """
+            SELECT * FROM referrals
+            WHERE UPPER(referral_code) = $1
+            """,
+            code
+        )
+
+    if not referral:
+        await ctx.reply(f"❌ No referral owner found for `{code}`.")
+        return
+
+    discord_id = referral["discord_id"]
+    try:
+        user = await bot.fetch_user(discord_id)
+        owner_text = f"{user.mention} ({user})"
+    except discord.DiscordException:
+        owner_text = f"Unknown user (`{discord_id}`)"
+
+    embed = discord.Embed(
+        title="🔎 Ace Referral Code Lookup",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="🎟️ Referral Code", value=f"`{referral['referral_code']}`", inline=False)
+    embed.add_field(name="👤 Code Owner", value=owner_text, inline=False)
+    embed.add_field(name="🆔 Discord ID", value=f"`{discord_id}`", inline=False)
+    embed.add_field(name="👥 Successful Referrals", value=str(referral["referral_count"]), inline=True)
+    embed.add_field(name="💰 Sales Generated", value=f"${float(referral['sales_generated']):.2f}", inline=True)
+    created_at = referral["created_at"]
+    embed.add_field(
+        name="📅 Code Created",
+        value=created_at.strftime("%B %d, %Y") if created_at else "Unknown",
+        inline=False
+    )
+    await ctx.reply(embed=embed)
+
+
+# =========================================================
 # REFERRAL PANEL
 # =========================================================
 
