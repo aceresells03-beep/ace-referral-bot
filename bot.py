@@ -956,6 +956,14 @@ async def lookup(ctx, code: str = None):
     await ctx.reply(embed=embed)
 
 
+@lookup.error
+async def lookup_error(ctx, error):
+    if isinstance(error, commands.NotOwner):
+        await ctx.reply("⛔ Only the bot owner can use `!lookup`.", mention_author=False)
+    else:
+        raise error
+
+
 # =========================================================
 # REFERRAL PANEL
 # =========================================================
