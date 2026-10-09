@@ -5,6 +5,10 @@ import asyncio
 import json
 import hmac
 import hashlib
+import secrets
+import smtplib
+from email.message import EmailMessage
+from datetime import datetime, timedelta, timezone
 
 import discord
 import asyncpg
@@ -25,6 +29,15 @@ SELLAUTH_SHOP_ID = os.getenv("SELLAUTH_SHOP_ID")
 SELLAUTH_WEBHOOK_SECRET = os.getenv("SELLAUTH_WEBHOOK_SECRET")
 
 PORT = int(os.getenv("PORT", "8080"))
+
+# Required for sending email verification codes. Configure in Railway Variables.
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
+EMAIL_CODE_SECRET = os.getenv("EMAIL_CODE_SECRET", "")
+
 
 
 # =========================================================
@@ -200,6 +213,20 @@ async def setup_database():
             """
         )
 
+    # Additional tables do not alter existing referral records.
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS referral_emails (
+                discord_id BIGINT PRIMARY KEY,
+                email TEXT NOT NULL,
+                verified BOOLEAN NOT NULL DEFAULT FALSE,
+                code_hash TEXT,
+                code_expires_at TIMESTAMPTZ,
+                verified_at TIMESTAMPTZ,
+                last_sent_at TIMESTAMPTZ
+            );
+        """)
+
     print(
         "Database connected and referral tables ready!"
     )
@@ -296,6 +323,17 @@ def extract_coupon_code(invoice):
     return None
 
 
+def extract_buyer_email(invoice):
+    """Best-effort extraction; confirm exact fields with your SellAuth payload."""
+    for record in (invoice, invoice.get("customer"), invoice.get("buyer")):
+        if isinstance(record, dict):
+            for key in ("email", "customer_email", "buyer_email"):
+                value = record.get(key)
+                if isinstance(value, str) and "@" in value:
+                    return value.strip().casefold()
+    return None
+
+
 # =========================================================
 # PROCESS REFERRAL SALE
 # =========================================================
@@ -383,6 +421,24 @@ async def process_referral_invoice(invoice_id):
                     f"for {coupon_code}."
                 )
 
+                return
+
+            # Never award credit for a verified account's own checkout email.
+            # If SellAuth doesn't return a usable buyer email, fail closed:
+            # do not award an unverified referral.
+            buyer_email = extract_buyer_email(invoice)
+            owner_email = await conn.fetchrow(
+                "SELECT email, verified FROM referral_emails WHERE discord_id = $1",
+                referral["discord_id"]
+            )
+            if not owner_email or not owner_email["verified"]:
+                print(f"Referral {coupon_code} not credited: owner email unverified")
+                return
+            if not buyer_email:
+                print(f"Referral {coupon_code} not credited: invoice buyer email unavailable")
+                return
+            if buyer_email.casefold() == owner_email["email"].casefold():
+                print(f"Self-referral blocked for {coupon_code}")
                 return
 
             inserted = await conn.fetchval(
@@ -965,6 +1021,140 @@ async def lookup_error(ctx, error):
 
 
 # =========================================================
+# PRIVATE EMAIL VERIFICATION AND OWNER CHECK
+# =========================================================
+
+def email_code_hash(discord_id, code):
+    return hmac.new(
+        EMAIL_CODE_SECRET.encode(), f"{discord_id}:{code}".encode(), hashlib.sha256
+    ).hexdigest()
+
+
+def send_verification_email(destination, code):
+    msg = EmailMessage()
+    msg["Subject"] = "Ace Services email verification"
+    msg["From"] = SMTP_FROM
+    msg["To"] = destination
+    msg.set_content(
+        f"Your Ace Services verification code is {code}. "
+        "It expires in 10 minutes. If you didn't request this, ignore it."
+    )
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.send_message(msg)
+
+
+@bot.command()
+@commands.dm_only()
+async def setmail(ctx, email: str = None):
+    """Register an email by DM. Never send addresses in public channels."""
+    if not email or len(email) > 254 or email.count("@") != 1 or " " in email:
+        await ctx.reply("Usage (DM only): `!setmail your@email.com`")
+        return
+    if not all((SMTP_HOST, SMTP_USER, SMTP_PASSWORD, SMTP_FROM, EMAIL_CODE_SECRET)):
+        await ctx.reply("Email verification is not configured yet. Contact the bot owner.")
+        return
+    email = email.strip().casefold()
+    async with db_pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            "SELECT email, verified, last_sent_at FROM referral_emails WHERE discord_id=$1",
+            ctx.author.id
+        )
+        now = datetime.now(timezone.utc)
+        if existing and existing["verified"] and existing["email"] == email:
+            await ctx.reply("This email is already verified.")
+            return
+        if existing and existing["last_sent_at"] and now - existing["last_sent_at"] < timedelta(minutes=2):
+            await ctx.reply("Please wait two minutes before requesting another code.")
+            return
+        code = f"{secrets.randbelow(1000000):06d}"
+        # Send first; only save pending state if delivery succeeds.
+        try:
+            await asyncio.to_thread(send_verification_email, email, code)
+        except Exception:
+            await ctx.reply("Couldn't send the verification email. Contact the bot owner.")
+            return
+        await conn.execute("""
+            INSERT INTO referral_emails
+                (discord_id,email,verified,code_hash,code_expires_at,verified_at,last_sent_at)
+            VALUES ($1,$2,FALSE,$3,$4,NULL,$5)
+            ON CONFLICT(discord_id) DO UPDATE SET
+                email=EXCLUDED.email, verified=FALSE,
+                code_hash=EXCLUDED.code_hash,
+                code_expires_at=EXCLUDED.code_expires_at,
+                verified_at=NULL, last_sent_at=EXCLUDED.last_sent_at
+        """, ctx.author.id, email, email_code_hash(ctx.author.id, code),
+             now + timedelta(minutes=10), now)
+    await ctx.reply("Verification email sent. Reply here with `!verifymail 123456`.")
+
+
+@bot.command()
+@commands.dm_only()
+async def verifymail(ctx, code: str = None):
+    if not code or len(code) != 6 or not code.isascii() or not code.isdigit():
+        await ctx.reply("Usage (DM only): `!verifymail 123456`")
+        return
+    if not EMAIL_CODE_SECRET:
+        await ctx.reply("Verification is not configured.")
+        return
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM referral_emails WHERE discord_id=$1", ctx.author.id
+        )
+        if not row or not row["code_hash"] or not row["code_expires_at"]:
+            await ctx.reply("No pending verification. Use `!setmail` first.")
+            return
+        if datetime.now(timezone.utc) >= row["code_expires_at"]:
+            await ctx.reply("Code expired. Use `!setmail` to request another.")
+            return
+        if not hmac.compare_digest(row["code_hash"], email_code_hash(ctx.author.id, code)):
+            await ctx.reply("Incorrect verification code.")
+            return
+        await conn.execute("""
+            UPDATE referral_emails
+            SET verified=TRUE, verified_at=NOW(), code_hash=NULL, code_expires_at=NULL
+            WHERE discord_id=$1
+        """, ctx.author.id)
+    await ctx.reply("✅ Your email is verified. Your eligible referrals can now earn credit.")
+
+
+@bot.command()
+@commands.is_owner()
+async def checkmail(ctx, member: discord.User = None):
+    """Only the application owner can request a member's registered email."""
+    if member is None:
+        await ctx.reply("Usage: `!checkmail @user` (run in your server)")
+        return
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT email, verified FROM referral_emails WHERE discord_id=$1", member.id
+        )
+    if not row:
+        report = f"Member: {member} ({member.id})\nEmail: Not registered"
+    else:
+        report = (f"Member: {member} ({member.id})\n"
+                  f"Full registered email: {row['email']}\n"
+                  f"Verified: {'Yes' if row['verified'] else 'No'}")
+    report += ("\nIP address: Unavailable. Discord does not provide member IPs; "
+               "checkout IPs cannot be reliably attributed to a Discord account.")
+    try:
+        await ctx.author.send(report)
+        if ctx.guild:
+            await ctx.reply("📩 Private email report sent to your DMs.", mention_author=False)
+    except discord.Forbidden:
+        await ctx.reply("Enable DMs from the bot to receive the private report.", mention_author=False)
+
+
+@checkmail.error
+async def checkmail_error(ctx, error):
+    if isinstance(error, commands.NotOwner):
+        await ctx.reply("⛔ Only the bot owner can use `!checkmail`.", mention_author=False)
+    else:
+        raise error
+
+
+# =========================================================
 # REFERRAL PANEL
 # =========================================================
 
@@ -1055,6 +1245,24 @@ async def main():
     await bot.start(
         TOKEN
     )
+
+
+
+
+@setmail.error
+async def setmail_error(ctx, error):
+    if isinstance(error, commands.PrivateMessageOnly):
+        await ctx.reply("Please DM me `!setmail your@email.com` instead of posting your email here.", mention_author=False)
+    else:
+        raise error
+
+
+@verifymail.error
+async def verifymail_error(ctx, error):
+    if isinstance(error, commands.PrivateMessageOnly):
+        await ctx.reply("Please DM me your verification code instead.", mention_author=False)
+    else:
+        raise error
 
 
 if __name__ == "__main__":
